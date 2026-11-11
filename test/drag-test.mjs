@@ -1,5 +1,5 @@
 // Drives the page in headless Chromium over CDP with real mouse and touch
-// input, and checks drag-to-paint, touch drawing, pinch zoom and undo.
+// input, and checks drag-to-paint, panning, touch drawing, pinch zoom and undo.
 // usage: node test/drag-test.mjs .   (needs chromium on PATH; takes several
 // minutes with software WebGL)
 import { spawn } from 'node:child_process'
@@ -177,9 +177,28 @@ check('re-drawing over a crossing keeps it', await evaluate(`T.code(${X} + 10, $
 await evaluate(`T.select('and_gate')`)
 await mouseClick(X + 40, Y + 40)
 check('click still places a gate', await evaluate(`T.code(${X} + 40, ${Y} + 40) == things.and_gate.code`))
-// a drag with a gate brush places just one gate where it began
-await mouseDrag([[X + 50, Y + 50], [X + 56, Y + 50]])
-check('drag with gate brush places one gate at the start', await evaluate(`T.code(${X} + 50, ${Y} + 50) == things.and_gate.code && T.code(${X} + 56, ${Y} + 50) == 0`))
+// a drag with a gate brush pans instead of placing anything
+async function checkPan(name, from, to) {
+    // the board point under the pointer when the drag starts should end up
+    // under the pointer when it ends
+    const a = await client(...from), b = await client(...to)
+    const u0 = await undoCount()
+    const under = await evaluate(`board_point(${a.x}, ${a.y})`)
+    await mouseDrag([from, to])
+    const now = await evaluate(`board_point(${b.x}, ${b.y})`)
+    const err = Math.hypot(now.x - under.x, now.y - under.y)
+    check(name, err < 0.5 && await undoCount() == u0, 'off by ' + err.toFixed(2) + ' cells')
+}
+const undoCount = () => evaluate('undo_stack.length')
+await checkPan('drag with gate brush pans, board follows the mouse', [X + 50, Y + 50], [X + 40, Y + 35])
+check('...and places no gate', await evaluate(`T.code(${X} + 50, ${Y} + 50) == 0`))
+
+// the hand tool: clicks do nothing, drags pan
+await evaluate(`T.select('hand')`)
+let u1 = await undoCount()
+await mouseClick(X + 45, Y + 45)
+check('hand tool click changes nothing', await undoCount() == u1 && await evaluate(`T.code(${X} + 45, ${Y} + 45) == 0`))
+await checkPan('hand tool drag pans', [X + 30, Y + 30], [X + 45, Y + 45])
 
 // 6. a click on an existing wire still toggles it (old behaviour)
 await evaluate(`T.select('wire'); view.speed = 0`)
@@ -235,10 +254,42 @@ let t = await client(PX + 5, PY + 30)
 await touch('touchStart', [t]); await touch('touchEnd', []); await sleep(100)
 check('tap places a wire pixel', await evaluate(`T.code(${PX} + 5, ${PY} + 30) == things.wire.code`))
 
+// one-finger drag with the default (flip switch) tool pans
+async function touchPan(name, from, to) {
+    const under = await evaluate(`board_point(${from.x}, ${from.y})`)
+    await touch('touchStart', [from])
+    for (let k = 1; k <= 10; k++) { await touch('touchMove', [{ x: from.x + (to.x - from.x) * k / 10, y: from.y + (to.y - from.y) * k / 10 }]); await sleep(16) }
+    await touch('touchEnd', [])
+    await sleep(100)
+    const now = await evaluate(`board_point(${to.x}, ${to.y})`)
+    const err = Math.hypot(now.x - under.x, now.y - under.y)
+    check(name, err < 0.5, 'off by ' + err.toFixed(2) + ' cells')
+}
+await evaluate(`T.select('toggle_toggle')`)
+let u2 = await evaluate('undo_stack.length')
+await touchPan('one-finger drag with flip-switch tool pans', { x: 200, y: 500 }, { x: 120, y: 420 })
+check('...and edits nothing', await evaluate('undo_stack.length') == u2)
+await evaluate(`T.select('hand')`)
+await touchPan('one-finger drag with hand tool pans', { x: 150, y: 450 }, { x: 230, y: 520 })
+
+// two fingers moving together pan, keeping the board under them
+await evaluate(`T.select('wire')`)
+{
+    let q1 = { x: 140, y: 450 }, q2 = { x: 240, y: 450 }
+    const under = await evaluate(`board_point(${(q1.x + q2.x) / 2}, ${q1.y})`)
+    await touch('touchStart', [q1]); await touch('touchStart', [q1, q2])
+    for (let k = 1; k <= 10; k++) { await touch('touchMove', [{ x: q1.x + 6 * k, y: q1.y - 5 * k }, { x: q2.x + 6 * k, y: q2.y - 5 * k }]); await sleep(16) }
+    await touch('touchEnd', []); await sleep(100)
+    const now = await evaluate(`board_point(${(q1.x + q2.x) / 2 + 60}, ${q1.y - 50})`)
+    const err = Math.hypot(now.x - under.x, now.y - under.y)
+    check('two-finger pan keeps the board under the fingers', err < 0.5, 'off by ' + err.toFixed(2) + ' cells')
+}
+
 // two-finger pinch: zooms, draws nothing
 let snapBefore = await evaluate(`Array.from(T.snap().filter((v, i) => i % 4 == 0)).reduce((n, v) => n + (v ? 1 : 0), 0)`)
 let scaleBefore = await evaluate('view.scale')
 let p1 = { x: 150, y: 400 }, p2 = { x: 240, y: 400 }
+const pinchUnder = await evaluate(`board_point(${(p1.x + p2.x) / 2}, ${p1.y})`)
 await touch('touchStart', [p1])
 await touch('touchStart', [p1, p2])
 for (let k = 1; k <= 10; k++) { await touch('touchMove', [{ x: p1.x - 4 * k, y: p1.y }, { x: p2.x + 4 * k, y: p2.y }]); await sleep(16) }
@@ -248,6 +299,28 @@ let scaleAfter = await evaluate('view.scale')
 let snapAfter = await evaluate(`Array.from(T.snap().filter((v, i) => i % 4 == 0)).reduce((n, v) => n + (v ? 1 : 0), 0)`)
 check('pinch out zooms in', scaleAfter > scaleBefore * 1.5, scaleBefore + ' -> ' + scaleAfter.toFixed(1))
 check('pinch draws nothing', snapAfter == snapBefore, snapBefore + ' vs ' + snapAfter)
+{
+    const now = await evaluate(`board_point(${(p1.x + p2.x) / 2}, ${p1.y})`)
+    const err = Math.hypot(now.x - pinchUnder.x, now.y - pinchUnder.y)
+    check('pinch zooms around the fingers, not the screen centre', err < 0.5, 'off by ' + err.toFixed(2) + ' cells')
+}
+
+// pinch, then lift one finger and keep moving the other: it keeps panning.
+// (CDP touch events can't lift just one finger, so this sends pointer events)
+{
+    const r = await evaluate(`(() => {
+        const ev = (type, id, x, y) => c.dispatchEvent(new PointerEvent(type, { pointerId : id, pointerType : 'touch', clientX : x, clientY : y, bubbles : true, isPrimary : id == 91 }))
+        ev('pointerdown', 91, 150, 450); ev('pointerdown', 92, 250, 450)
+        for (let k = 1; k <= 5; k++) { ev('pointermove', 91, 150 - 3 * k, 450); ev('pointermove', 92, 250 + 3 * k, 450) }
+        ev('pointerup', 92, 265, 450)
+        const under = board_point(135, 450)
+        for (let k = 1; k <= 8; k++) ev('pointermove', 91, 135 + 8 * k, 450 + 6 * k)
+        const now = board_point(199, 498)
+        ev('pointerup', 91, 199, 498)
+        return { err : Math.hypot(now.x - under.x, now.y - under.y), left : pointers.size, stroke : stroke }
+    })()`)
+    check('after lifting one finger of a pinch, the other keeps panning', r.err < 0.5 && r.left == 0 && r.stroke == null, 'off by ' + r.err.toFixed(2) + ' cells')
+}
 
 // screenshot of the phone layout
 await evaluate(`set_zoom(12)`)
