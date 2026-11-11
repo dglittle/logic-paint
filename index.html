@@ -1,4 +1,6 @@
+<meta charset="utf-8">
 <title>Logic Paint</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
 <body style="background:white;margin:0px;display:grid;width:100%;height:100%;grid-template-rows:auto 1fr">
     <div id="top_d" style=""></div>
@@ -6,7 +8,7 @@
 </body>
 <script>
 
-console.log('0.0.5')
+console.log('0.0.6')
 
 var tau = Math.PI * 2
 
@@ -338,7 +340,7 @@ function set_zoom(new_zoom) {
 
 function draw_palette() {
     var d = document.createElement('div')
-    d.style.height = innerWidth > innerHeight ? '40px' : '80px'
+    d.style.lineHeight = '0'
 
     function drawMagnifyingGlass(c, g) {
         g.beginPath()
@@ -989,8 +991,8 @@ function draw_palette() {
         b.append(c)
         d.append(b)
     }
-    createTextButton('↶', 'Undo (Ctrl/⌘+Z)', () => undo())
-    createTextButton('↷', 'Redo (Ctrl/⌘+Shift+Z)', () => redo())
+    createTextButton('\u21B6', 'Undo (Ctrl/\u2318+Z)', () => undo())
+    createTextButton('\u21B7', 'Redo (Ctrl/\u2318+Shift+Z)', () => redo())
 
     document.addEventListener('keydown', function (e) {
         if (view.brush == 'box' && e.keyCode == 8 && view.box && view.box.length == 4) {
@@ -1091,8 +1093,239 @@ async function load_img(url, history = true) {
 }
 
 
-c.onclick = function (e) {
-    my_on_mouse_up(getRelPos(c, e), e)
+// pointer input (mouse, pen and touch):
+// - a tap or click does what a click always did
+// - dragging with the wire brush draws a straight wire; moving well off the
+//   line turns a corner
+// - dragging with the delete brush erases along the path
+// - dragging with the box brush selects a rectangle
+// - two fingers pan and pinch-zoom
+c.style['touch-action'] = 'none'
+
+var pointers = new Map()
+var stroke = null
+var pinch = null
+var gesture_lock = false
+
+function pointer_mid() {
+    var ps = [...pointers.values()]
+    return {
+        x : (ps[0].x + ps[1].x) / 2,
+        y : (ps[0].y + ps[1].y) / 2,
+        dist : Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)
+    }
+}
+
+function cell_size_css() {
+    return view.scale / devicePixelRatio
+}
+
+c.addEventListener('pointerdown', function (e) {
+    if (e.pointerType == 'mouse' && e.button != 0) return
+    c.setPointerCapture(e.pointerId)
+    pointers.set(e.pointerId, { x : e.clientX, y : e.clientY })
+
+    if (pointers.size == 2) {
+        // a second finger means pan/zoom, not drawing
+        if (stroke) cancel_stroke()
+        gesture_lock = true
+        pinch = pointer_mid()
+        return
+    }
+    if (pointers.size > 2 || gesture_lock) return
+
+    stroke = {
+        id : e.pointerId,
+        start_x : e.clientX,
+        start_y : e.clientY,
+        start_pos : getRelPos(c, e),
+        start : pos_to_cell(getRelPos(c, e)),
+        shift : e.shiftKey,
+        mode : 'pending'
+    }
+    e.preventDefault()
+})
+
+c.addEventListener('pointermove', function (e) {
+    if (!pointers.has(e.pointerId)) return
+    pointers.set(e.pointerId, { x : e.clientX, y : e.clientY })
+
+    if (pinch && pointers.size == 2) {
+        var now = pointer_mid()
+        bottom_d.scrollLeft -= now.x - pinch.x
+        bottom_d.scrollTop -= now.y - pinch.y
+        if (pinch.dist > 0 && now.dist > 0) {
+            var scale = Math.min(64, Math.max(0.25, view.scale * now.dist / pinch.dist))
+            if (scale != view.scale) set_zoom(scale)
+        }
+        pinch = now
+        return
+    }
+
+    if (!stroke || stroke.id != e.pointerId) return
+
+    if (stroke.mode == 'pending') {
+        var moved = Math.hypot(e.clientX - stroke.start_x, e.clientY - stroke.start_y)
+        if (moved < (e.pointerType == 'mouse' ? 3 : 8)) return
+        if (stroke.shift) return
+        if (!start_stroke()) return
+    }
+
+    stroke.target = pos_to_cell(getRelPos(c, e))
+    if (!stroke.frame) stroke.frame = requestAnimationFrame(continue_stroke)
+})
+
+function pointer_end(e) {
+    if (!pointers.has(e.pointerId)) return
+    pointers.delete(e.pointerId)
+    if (pointers.size < 2) pinch = null
+    if (pointers.size == 0) gesture_lock = false
+
+    if (!stroke || stroke.id != e.pointerId) return
+    var s = stroke
+    if (s.mode == 'pending') {
+        stroke = null
+        if (e.type == 'pointerup') my_on_mouse_up(s.start_pos, e)
+        return
+    }
+    if (e.type == 'pointerup') {
+        s.target = pos_to_cell(getRelPos(c, e))
+        continue_stroke()
+        finish_stroke()
+    } else cancel_stroke()
+}
+c.addEventListener('pointerup', pointer_end)
+c.addEventListener('pointercancel', pointer_end)
+
+function start_stroke() {
+    var s = stroke
+    if (view.brush == 'wire' || view.brush == 'delete') {
+        s.mode = view.brush
+        s.anchor = s.start
+        s.end = s.start
+        s.axis = null
+        s.done = new Set()
+        begin_history_group()
+        draw_on_chip(f => paint_cell(f, s.start.x, s.start.y, null))
+    } else if (view.brush == 'box') {
+        s.mode = 'box'
+        view.box = [s.start.x, s.start.y]
+    } else {
+        // other brushes place one piece; a drag just places it where it began
+        return false
+    }
+    return true
+}
+
+function paint_cell(f, x, y, direction) {
+    if (x < 1 || x >= W - 1 || y < 1 || y >= H - 1) return
+    var key = x + y * W
+    if (stroke.done.has(key)) return
+    stroke.done.add(key)
+    if (stroke.mode == 'wire') {
+        // keep existing crossings, and don't reset the wire a stroke starts on
+        var code = f[x * 4 + y * W * 4]
+        if (code == things.cross_gate.code) return
+        if (code == things.wire.code) {
+            // an existing wire is left alone unless this stroke crosses it
+            var crossing = direction == 'horz' ?
+                f[x * 4 + (y - 1) * W * 4] == things.wire.code && f[x * 4 + (y + 1) * W * 4] == things.wire.code :
+                direction == 'vert' &&
+                f[(x - 1) * 4 + y * W * 4] == things.wire.code && f[(x + 1) * 4 + y * W * 4] == things.wire.code
+            if (!crossing) return
+        }
+        add_wire(f, x, y, direction)
+    } else erase_at(f, x, y)
+}
+
+function continue_stroke() {
+    var s = stroke
+    if (!s) return
+    if (s.frame) cancelAnimationFrame(s.frame)
+    s.frame = null
+    var t = s.target
+    if (!t) return
+
+    if (s.mode == 'box') {
+        view.box = [
+            Math.min(s.start.x, t.x),
+            Math.min(s.start.y, t.y),
+            Math.max(s.start.x, t.x),
+            Math.max(s.start.y, t.y)
+        ]
+        dirty = true
+        return
+    }
+
+    if (s.mode == 'delete') {
+        // erase every cell along the path from the last point
+        draw_on_chip(f => {
+            var n = Math.max(Math.abs(t.x - s.end.x), Math.abs(t.y - s.end.y))
+            for (var i = 1; i <= n; i++)
+                paint_cell(f, Math.round(s.end.x + (t.x - s.end.x) * i / n), Math.round(s.end.y + (t.y - s.end.y) * i / n), null)
+        })
+        s.end = t
+        return
+    }
+
+    // wire: follow one axis from the anchor; if the pointer strays far
+    // enough off that axis, turn a corner at the current end of the line
+    var dx = t.x - s.anchor.x
+    var dy = t.y - s.anchor.y
+    if (!s.axis) {
+        if (dx == 0 && dy == 0) return
+        s.axis = Math.abs(dx) >= Math.abs(dy) ? 'horz' : 'vert'
+    }
+    var turn = Math.max(2, Math.round(8 / cell_size_css()))
+    if (s.axis == 'horz' && Math.abs(dy) >= turn) {
+        s.anchor = { x : s.end.x, y : s.anchor.y }
+        s.axis = 'vert'
+    } else if (s.axis == 'vert' && Math.abs(dx) >= turn) {
+        s.anchor = { x : s.anchor.x, y : s.end.y }
+        s.axis = 'horz'
+    }
+    var target = s.axis == 'horz' ? { x : t.x, y : s.anchor.y } : { x : s.anchor.x, y : t.y }
+    draw_on_chip(f => {
+        if (s.axis == 'horz') {
+            var step = target.x >= s.end.x ? 1 : -1
+            for (var x = s.end.x; x != target.x + step; x += step) paint_cell(f, x, target.y, 'horz')
+        } else {
+            var step = target.y >= s.end.y ? 1 : -1
+            for (var y = s.end.y; y != target.y + step; y += step) paint_cell(f, target.x, y, 'vert')
+        }
+    })
+    s.end = target
+}
+
+function finish_stroke() {
+    var s = stroke
+    stroke = null
+    if (s.frame) cancelAnimationFrame(s.frame)
+    if (s.mode == 'box') {
+        if (view.box.length == 4) {
+            view.copy = []
+            draw_on_chip(f => {
+                for (var x = view.box[0]; x <= view.box[2]; x++)
+                    for (var y = view.box[1]; y <= view.box[3]; y++)
+                        for (var i = 0; i < 4; i++)
+                            view.copy.push(f[x*4 + y*W*4 + i])
+            }, { history : false })
+        }
+        return
+    }
+    end_history_group()
+    // so a following shift-click continues from the end of this stroke
+    view.prev_x = s.end.x
+    view.prev_y = s.end.y
+}
+
+function cancel_stroke() {
+    var s = stroke
+    stroke = null
+    if (s.frame) cancelAnimationFrame(s.frame)
+    if (s.mode == 'box') view.box = null
+    else if (s.mode != 'pending') cancel_history_group()
+    dirty = true
 }
 
 // undo history: each entry lists the pixels an edit changed, with their
@@ -1128,9 +1361,54 @@ function draw_on_chip(cb, options) {
     if (record) record_edit(before, f)
 }
 
+// while a group is open (e.g. during a drag stroke), edits are merged into
+// it, so the whole stroke undoes as one step
+var history_group = null
+
+function begin_history_group() {
+    history_group = new Map()
+}
+
+function end_history_group() {
+    var group = history_group
+    history_group = null
+    var changed = [...group].filter(([i, v]) => v[0] != v[1])
+    if (!changed.length) return
+    var edit = {
+        index : new Uint32Array(changed.length),
+        before : new Uint32Array(changed.length),
+        after : new Uint32Array(changed.length)
+    }
+    changed.forEach(([i, v], j) => {
+        edit.index[j] = i
+        edit.before[j] = v[0]
+        edit.after[j] = v[1]
+    })
+    push_edit(edit)
+}
+
+function cancel_history_group() {
+    var group = history_group
+    history_group = null
+    draw_on_chip(f => {
+        var p = new Uint32Array(f.buffer, f.byteOffset, W * H)
+        group.forEach((v, i) => p[i] = v[0])
+    }, { history : false })
+}
+
 function record_edit(before, after) {
     var b = new Uint32Array(before.buffer)
     var a = new Uint32Array(after.buffer, after.byteOffset, W * H)
+
+    if (history_group) {
+        for (var i = 0; i < b.length; i++) if (b[i] != a[i]) {
+            var v = history_group.get(i)
+            if (v) v[1] = a[i]
+            else history_group.set(i, [b[i], a[i]])
+        }
+        return
+    }
+
     var count = 0
     for (var i = 0; i < b.length; i++) if (b[i] != a[i]) count++
     if (!count) return
@@ -1147,7 +1425,11 @@ function record_edit(before, after) {
         edit.after[j] = a[i]
         j++
     }
+    push_edit(edit)
+}
 
+function push_edit(edit) {
+    var count = edit.index.length
     undo_stack.push(edit)
     history_bytes += count * 12
     redo_stack.forEach(e => history_bytes -= e.index.length * 12)
@@ -1164,6 +1446,7 @@ function apply_edit(edit, values) {
 }
 
 function undo() {
+    if (history_group) return
     var edit = undo_stack.pop()
     if (!edit) return
     apply_edit(edit, edit.before)
@@ -1171,6 +1454,7 @@ function undo() {
 }
 
 function redo() {
+    if (history_group) return
     var edit = redo_stack.pop()
     if (!edit) return
     apply_edit(edit, edit.after)
@@ -1186,13 +1470,61 @@ document.addEventListener('keydown', function (e) {
     e.preventDefault()
 })
 
-function my_on_mouse_up(pos, e) {
-    var scrollable_div = bottom_d
-    pos.x += scrollable_div.scrollLeft
-    pos.y += scrollable_div.scrollTop
+// add a wire pixel; drawing across a perpendicular wire makes a crossing
+function add_wire(f, x, y, direction) {
+    if (direction == 'horz') {
+        if (f[x * 4 + (y + 0) * W * 4] == things.wire.code &&
+            f[x * 4 + (y - 1) * W * 4] == things.wire.code &&
+            f[x * 4 + (y + 1) * W * 4] == things.wire.code) {
+            f[x * 4 + (y + 0) * W * 4 + 0] = things.cross_gate.code
+            f[x * 4 + (y + 0) * W * 4 + 1] = 0
+            f[x * 4 + (y + 0) * W * 4 + 2] = 0
+            f[x * 4 + (y + 0) * W * 4 + 3] = 0
+            return
+        }
+    }
+    if (direction == 'vert') {
+        if (f[(x + 0) * 4 + y * W * 4] == things.wire.code &&
+            f[(x - 1) * 4 + y * W * 4] == things.wire.code &&
+            f[(x + 1) * 4 + y * W * 4] == things.wire.code) {
+            f[x * 4 + (y + 0) * W * 4 + 0] = things.cross_gate.code
+            f[x * 4 + (y + 0) * W * 4 + 1] = 0
+            f[x * 4 + (y + 0) * W * 4 + 2] = 0
+            f[x * 4 + (y + 0) * W * 4 + 3] = 0
+            return
+        }
+    }
+    f[x * 4 + y * W * 4 + 0] = things.wire.code
+    f[x * 4 + y * W * 4 + 1] = 0
+    f[x * 4 + y * W * 4 + 2] = 0
+    f[x * 4 + y * W * 4 + 3] = 0
+}
 
-    var x = Math.floor(pos.x * devicePixelRatio / view.scale)
-    var y = H - Math.floor(pos.y * devicePixelRatio / view.scale) - 1
+// erase the pixel at x, y, or a big piece covering it
+function erase_at(f, x, y) {
+    for (var dy = 0; dy <= 2; dy++) {
+        for (var dx = -2; dx <= 0; dx++) {
+            let thing = code_to_thing[f[(x + dx) * 4 + (y + dy) * W * 4]]
+            if ((dx == 0 && dy == 0) || things[thing]?.big) {
+                f[(x + dx) * 4 + (y + dy) * W * 4 + 0] = 0
+                f[(x + dx) * 4 + (y + dy) * W * 4 + 1] = 0
+                f[(x + dx) * 4 + (y + dy) * W * 4 + 2] = 0
+                f[(x + dx) * 4 + (y + dy) * W * 4 + 3] = 0
+            }
+        }
+    }
+}
+
+function pos_to_cell(pos) {
+    var scrollable_div = bottom_d
+    return {
+        x : Math.floor((pos.x + scrollable_div.scrollLeft) * devicePixelRatio / view.scale),
+        y : H - Math.floor((pos.y + scrollable_div.scrollTop) * devicePixelRatio / view.scale) - 1
+    }
+}
+
+function my_on_mouse_up(pos, e) {
+    var {x, y} = pos_to_cell(pos)
 
     if (view.brush == 'toggle_toggle') {
         draw_on_chip(f => {
@@ -1291,49 +1623,11 @@ function my_on_mouse_up(pos, e) {
                             delete_wires_at(view.prev_x, i)
                 }
             } else {
-                for (var dy = 0; dy <= 2; dy++) {
-                    for (var dx = -2; dx <= 0; dx++) {
-                        let thing = code_to_thing[f[(x + dx) * 4 + (y + dy) * W * 4]]
-                        if ((dx == 0 && dy == 0) || things[thing]?.big) {
-                            f[(x + dx) * 4 + (y + dy) * W * 4 + 0] = 0
-                            f[(x + dx) * 4 + (y + dy) * W * 4 + 1] = 0
-                            f[(x + dx) * 4 + (y + dy) * W * 4 + 2] = 0
-                            f[(x + dx) * 4 + (y + dy) * W * 4 + 3] = 0
-                        }
-                    }
-                }
+                erase_at(f, x, y)
             }
         })
     } else if (view.brush == 'wire') {
         draw_on_chip(f => {
-            function add_wire(x, y, direction) {
-                if (direction == 'horz') {
-                    if (f[x * 4 + (y + 0) * W * 4] == things.wire.code &&
-                        f[x * 4 + (y - 1) * W * 4] == things.wire.code &&
-                        f[x * 4 + (y + 1) * W * 4] == things.wire.code) {
-                        f[x * 4 + (y + 0) * W * 4 + 0] = things.cross_gate.code
-                        f[x * 4 + (y + 0) * W * 4 + 1] = 0
-                        f[x * 4 + (y + 0) * W * 4 + 2] = 0
-                        f[x * 4 + (y + 0) * W * 4 + 3] = 0
-                        return
-                    }
-                }
-                if (direction == 'vert') {
-                    if (f[(x + 0) * 4 + y * W * 4] == things.wire.code &&
-                        f[(x - 1) * 4 + y * W * 4] == things.wire.code &&
-                        f[(x + 1) * 4 + y * W * 4] == things.wire.code) {
-                        f[x * 4 + (y + 0) * W * 4 + 0] = things.cross_gate.code
-                        f[x * 4 + (y + 0) * W * 4 + 1] = 0
-                        f[x * 4 + (y + 0) * W * 4 + 2] = 0
-                        f[x * 4 + (y + 0) * W * 4 + 3] = 0
-                        return
-                    }
-                }
-                f[x * 4 + y * W * 4 + 0] = things.wire.code
-                f[x * 4 + y * W * 4 + 1] = 0
-                f[x * 4 + y * W * 4 + 2] = 0
-                f[x * 4 + y * W * 4 + 3] = 0
-            }
             if (e.shiftKey) {
                 var dx = x - view.prev_x
                 var dy = y - view.prev_y
@@ -1341,19 +1635,19 @@ function my_on_mouse_up(pos, e) {
                     y = view.prev_y
                     if (dx > 0) {
                         for (var i = view.prev_x; i <= x; i++)
-                            add_wire(i, y, 'horz')
+                            add_wire(f, i, y, 'horz')
                     } else {
                         for (var i = x; i <= view.prev_x; i++)
-                            add_wire(i, y, 'horz')
+                            add_wire(f, i, y, 'horz')
                     }
                 } else {
                     x = view.prev_x
                     if (dy > 0) {
                         for (var i = view.prev_y; i <= y; i++)
-                            add_wire(x, i, 'vert')
+                            add_wire(f, x, i, 'vert')
                     } else {
                         for (var i = y; i <= view.prev_y; i++)
-                            add_wire(x, i, 'vert')
+                            add_wire(f, x, i, 'vert')
                     }
                 }
             } else {
