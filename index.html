@@ -8,7 +8,7 @@
 </body>
 <script>
 
-console.log('0.0.6')
+console.log('0.0.7')
 
 var tau = Math.PI * 2
 
@@ -324,15 +324,19 @@ function each(x, cb) {
     Object.entries(x).forEach(([k, v]) => cb(v, k))
 }
 
+function set_scale(new_zoom) {
+    view.scale = new_zoom
+    var c = bottom_d.firstChild
+    c.style.width = (W * view.scale)/devicePixelRatio + 'px'
+    c.style.height = (H * view.scale)/devicePixelRatio + 'px'
+}
+
 function set_zoom(new_zoom) {
     var sd = bottom_d
     var x = (sd.scrollLeft + sd.clientWidth / 2) / sd.scrollWidth
     var y = (sd.scrollTop + sd.clientHeight / 2) / sd.scrollHeight
 
-    view.scale = new_zoom
-    var c = sd.firstChild
-    c.style.width = (W * view.scale)/devicePixelRatio + 'px'
-    c.style.height = (H * view.scale)/devicePixelRatio + 'px'
+    set_scale(new_zoom)
 
     sd.scrollLeft = x * sd.scrollWidth - sd.clientWidth / 2
     sd.scrollTop = y * sd.scrollHeight - sd.clientHeight / 2        
@@ -560,6 +564,7 @@ function draw_palette() {
 
         b.onclick = function () {
             view.brush = brush
+            bottom_d.firstChild.style.cursor = brush == 'hand' ? 'grab' : ''
             each(radio_buttons, function (x, k) {
             	if (k != brush) x.drawOff(x.c, x.g)
             })
@@ -800,6 +805,28 @@ function draw_palette() {
         g.fillStyle = 'rgb(0, 0, 0)'
         g.fillRect(19, 17, 2, 6)
     }, 'flip')
+    function draw_hand(g, color) {
+        g.fillStyle = color
+        g.fillRect(13, 10, 3, 12)
+        g.fillRect(17, 8, 3, 14)
+        g.fillRect(21, 9, 3, 13)
+        g.fillRect(25, 12, 3, 10)
+        g.fillRect(13, 19, 15, 9)
+        g.fillRect(15, 28, 11, 3)
+        g.fillRect(9, 19, 3, 3)
+        g.fillRect(10, 21, 3, 3)
+        g.fillRect(11, 23, 3, 3)
+    }
+    create_radio_button(function (c, g) {
+        g.fillStyle = 'rgb(255, 255, 0)'
+        g.fillRect(0, 0, 40, 40)
+        g.fillStyle = 'rgb(0, 40, 0)'
+        g.fillRect(4, 4, 32, 32)
+        draw_hand(g, 'rgb(255, 255, 255)')
+    }, function (c, g) {
+        do_unselected_background(g)
+        draw_hand(g, 'rgb(0, 0, 0)')
+    }, 'hand')
 
     function createRotateButton() {
         var b = document.createElement('div')
@@ -1099,7 +1126,8 @@ async function load_img(url, history = true) {
 //   line turns a corner
 // - dragging with the delete brush erases along the path
 // - dragging with the box brush selects a rectangle
-// - two fingers pan and pinch-zoom
+// - dragging with any other brush, or with the hand tool, pans
+// - two fingers pan and pinch-zoom; the board stays stuck under the fingers
 c.style['touch-action'] = 'none'
 
 var pointers = new Map()
@@ -1120,16 +1148,38 @@ function cell_size_css() {
     return view.scale / devicePixelRatio
 }
 
+// the board position (in cells, unrounded) under a point on the screen
+function board_point(client_x, client_y) {
+    var r = c.getBoundingClientRect()
+    return { x : (client_x - r.left) / cell_size_css(), y : (client_y - r.top) / cell_size_css() }
+}
+
+// scroll so that board point p ends up under the given screen point
+function put_board_point(p, client_x, client_y) {
+    var r = c.getBoundingClientRect()
+    bottom_d.scrollLeft += r.left + p.x * cell_size_css() - client_x
+    bottom_d.scrollTop += r.top + p.y * cell_size_css() - client_y
+}
+
+function start_pinch() {
+    var m = pointer_mid()
+    pinch = { dist : m.dist, scale : view.scale, anchor : board_point(m.x, m.y) }
+}
+
+function start_pan(id, x, y) {
+    stroke = { id : id, mode : 'pan', anchor : board_point(x, y) }
+}
+
 c.addEventListener('pointerdown', function (e) {
     if (e.pointerType == 'mouse' && e.button != 0) return
-    c.setPointerCapture(e.pointerId)
+    try { c.setPointerCapture(e.pointerId) } catch (err) {}
     pointers.set(e.pointerId, { x : e.clientX, y : e.clientY })
 
     if (pointers.size == 2) {
         // a second finger means pan/zoom, not drawing
         if (stroke) cancel_stroke()
         gesture_lock = true
-        pinch = pointer_mid()
+        start_pinch()
         return
     }
     if (pointers.size > 2 || gesture_lock) return
@@ -1151,24 +1201,32 @@ c.addEventListener('pointermove', function (e) {
     pointers.set(e.pointerId, { x : e.clientX, y : e.clientY })
 
     if (pinch && pointers.size == 2) {
-        var now = pointer_mid()
-        bottom_d.scrollLeft -= now.x - pinch.x
-        bottom_d.scrollTop -= now.y - pinch.y
-        if (pinch.dist > 0 && now.dist > 0) {
-            var scale = Math.min(64, Math.max(0.25, view.scale * now.dist / pinch.dist))
-            if (scale != view.scale) set_zoom(scale)
+        var m = pointer_mid()
+        if (pinch.dist > 0 && m.dist > 0) {
+            var scale = Math.min(64, Math.max(0.25, pinch.scale * m.dist / pinch.dist))
+            if (scale != view.scale) set_scale(scale)
         }
-        pinch = now
+        put_board_point(pinch.anchor, m.x, m.y)
         return
     }
 
     if (!stroke || stroke.id != e.pointerId) return
 
+    if (stroke.mode == 'pan') {
+        put_board_point(stroke.anchor, e.clientX, e.clientY)
+        return
+    }
+
     if (stroke.mode == 'pending') {
         var moved = Math.hypot(e.clientX - stroke.start_x, e.clientY - stroke.start_y)
         if (moved < (e.pointerType == 'mouse' ? 3 : 8)) return
         if (stroke.shift) return
-        if (!start_stroke()) return
+        if (!start_stroke()) {
+            // brushes that don't paint by dragging pan instead
+            start_pan(stroke.id, stroke.start_x, stroke.start_y)
+            put_board_point(stroke.anchor, e.clientX, e.clientY)
+            return
+        }
     }
 
     stroke.target = pos_to_cell(getRelPos(c, e))
@@ -1178,11 +1236,20 @@ c.addEventListener('pointermove', function (e) {
 function pointer_end(e) {
     if (!pointers.has(e.pointerId)) return
     pointers.delete(e.pointerId)
-    if (pointers.size < 2) pinch = null
+    if (pinch && pointers.size == 1) {
+        // lifting one finger of a pinch: keep panning with the other
+        pinch = null
+        var [id, p] = [...pointers][0]
+        start_pan(id, p.x, p.y)
+    }
     if (pointers.size == 0) gesture_lock = false
 
     if (!stroke || stroke.id != e.pointerId) return
     var s = stroke
+    if (s.mode == 'pan') {
+        stroke = null
+        return
+    }
     if (s.mode == 'pending') {
         stroke = null
         if (e.type == 'pointerup') my_on_mouse_up(s.start_pos, e)
@@ -1199,6 +1266,7 @@ c.addEventListener('pointercancel', pointer_end)
 
 function start_stroke() {
     var s = stroke
+    if (view.brush == 'hand') return false
     if (view.brush == 'wire' || view.brush == 'delete') {
         s.mode = view.brush
         s.anchor = s.start
@@ -1211,7 +1279,7 @@ function start_stroke() {
         s.mode = 'box'
         view.box = [s.start.x, s.start.y]
     } else {
-        // other brushes place one piece; a drag just places it where it began
+        // other brushes place one piece on a click; a drag pans
         return false
     }
     return true
@@ -1324,7 +1392,7 @@ function cancel_stroke() {
     stroke = null
     if (s.frame) cancelAnimationFrame(s.frame)
     if (s.mode == 'box') view.box = null
-    else if (s.mode != 'pending') cancel_history_group()
+    else if (s.mode == 'wire' || s.mode == 'delete') cancel_history_group()
     dirty = true
 }
 
@@ -1524,6 +1592,7 @@ function pos_to_cell(pos) {
 }
 
 function my_on_mouse_up(pos, e) {
+    if (view.brush == 'hand') return
     var {x, y} = pos_to_cell(pos)
 
     if (view.brush == 'toggle_toggle') {
