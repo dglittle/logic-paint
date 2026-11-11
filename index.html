@@ -6,7 +6,7 @@
 </body>
 <script>
 
-console.log('0.0.4')
+console.log('0.0.5')
 
 var tau = Math.PI * 2
 
@@ -533,7 +533,7 @@ function draw_palette() {
         b.onclick = function () {
             draw_on_chip(f => {
                 for (var i = 1; i < f.length; i += 4) if (f[i - 1] != things.toggle.code && f[i - 1] != things.small_toggle.code) f[i] = 0
-            })
+            }, { history : false })
         }
 
         b.append(c)
@@ -963,6 +963,35 @@ function draw_palette() {
     }
     createFlipVertButton()
 
+    function createTextButton(text, title, onclick) {
+        var b = document.createElement('div')
+        b.style.background = 'white'
+        b.style.display = 'inline-block'
+        b.style.width = '40px'
+        b.style.height = '40px'
+        b.title = title
+
+        var c = document.createElement('canvas')
+        c.width = 40 * dpr
+        c.height = 40 * dpr
+        c.style.width = '40px'
+        c.style.height = '40px'
+        var g = c.getContext('2d')
+
+        g.fillStyle = 'black'
+        g.font = (25 * dpr) + 'px Arial'
+        g.textAlign = 'center'
+        g.textBaseline = 'middle'
+        g.fillText(text, 20 * dpr, 20 * dpr)
+
+        b.onclick = onclick
+
+        b.append(c)
+        d.append(b)
+    }
+    createTextButton('↶', 'Undo (Ctrl/⌘+Z)', () => undo())
+    createTextButton('↷', 'Redo (Ctrl/⌘+Shift+Z)', () => redo())
+
     document.addEventListener('keydown', function (e) {
         if (view.brush == 'box' && e.keyCode == 8 && view.box && view.box.length == 4) {
             // 8 = DELETE
@@ -982,9 +1011,9 @@ let params = (new URL(document.location)).searchParams
 if (params.get('nobar') == null) top_d.append(draw_palette())
 if (params.get('zoom') != null) set_zoom(1*params.get('zoom'))
 
-load_img('chip006.png')
+load_img('chip006.png', false)
 
-async function load_img(url) {
+async function load_img(url, history = true) {
     var im = new Image()
     await new Promise(done => {
         im.onload = done
@@ -1058,7 +1087,7 @@ async function load_img(url) {
                 }
             }
         }                        
-    })
+    }, { history : history })
 }
 
 
@@ -1066,18 +1095,96 @@ c.onclick = function (e) {
     my_on_mouse_up(getRelPos(c, e), e)
 }
 
-function draw_on_chip(cb) {
+// undo history: each entry lists the pixels an edit changed, with their
+// before and after values, so undoing only touches those pixels and the
+// rest of the running circuit keeps its state
+var undo_stack = []
+var redo_stack = []
+var history_bytes = 0
+var max_history_bytes = 64 * 1024 * 1024
+var draw_depth = 0
+
+function draw_on_chip(cb, options) {
+    var record = draw_depth == 0 && !(options && options.history == false)
+    draw_depth++
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb2)
     gl.readPixels(0, 0, gl.canvas.width, gl.canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, f)
 
-    cb(f)
+    var before = record ? f.slice() : null
+
+    try {
+        cb(f)
+    } finally {
+        draw_depth--
+    }
 
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, targetTexture)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, f)
 
     dirty = true
+
+    if (record) record_edit(before, f)
 }
+
+function record_edit(before, after) {
+    var b = new Uint32Array(before.buffer)
+    var a = new Uint32Array(after.buffer, after.byteOffset, W * H)
+    var count = 0
+    for (var i = 0; i < b.length; i++) if (b[i] != a[i]) count++
+    if (!count) return
+
+    var edit = {
+        index : new Uint32Array(count),
+        before : new Uint32Array(count),
+        after : new Uint32Array(count)
+    }
+    var j = 0
+    for (var i = 0; i < b.length; i++) if (b[i] != a[i]) {
+        edit.index[j] = i
+        edit.before[j] = b[i]
+        edit.after[j] = a[i]
+        j++
+    }
+
+    undo_stack.push(edit)
+    history_bytes += count * 12
+    redo_stack.forEach(e => history_bytes -= e.index.length * 12)
+    redo_stack = []
+    while (history_bytes > max_history_bytes && undo_stack.length > 1)
+        history_bytes -= undo_stack.shift().index.length * 12
+}
+
+function apply_edit(edit, values) {
+    draw_on_chip(f => {
+        var p = new Uint32Array(f.buffer, f.byteOffset, W * H)
+        for (var j = 0; j < edit.index.length; j++) p[edit.index[j]] = values[j]
+    }, { history : false })
+}
+
+function undo() {
+    var edit = undo_stack.pop()
+    if (!edit) return
+    apply_edit(edit, edit.before)
+    redo_stack.push(edit)
+}
+
+function redo() {
+    var edit = redo_stack.pop()
+    if (!edit) return
+    apply_edit(edit, edit.after)
+    undo_stack.push(edit)
+}
+
+document.addEventListener('keydown', function (e) {
+    if (!(e.ctrlKey || e.metaKey)) return
+    var key = e.key.toLowerCase()
+    if (key == 'z' && !e.shiftKey) undo()
+    else if ((key == 'z' && e.shiftKey) || key == 'y') redo()
+    else return
+    e.preventDefault()
+})
 
 function my_on_mouse_up(pos, e) {
     var scrollable_div = bottom_d
@@ -1097,7 +1204,7 @@ function my_on_mouse_up(pos, e) {
                     }
                 }
             }
-        })
+        }, { history : false })
     } else if (view.brush == 'flip') {
         draw_on_chip(f => {
             // flip the wire pixel nearest the click (within 2 px); the
@@ -1114,7 +1221,7 @@ function my_on_mouse_up(pos, e) {
             if (hit == null) return
             f[hit + 1] = f[hit + 1] ? 0 : 255
             f[hit + 2] = 255
-        })
+        }, { history : false })
     } else if (view.brush == 'box') {
         draw_on_chip(f => {
             if (e.shiftKey && view.box && view.box.length == 4) {
