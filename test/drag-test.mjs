@@ -226,6 +226,24 @@ await mouseDrag([[X, Y + 45], [X + 20, Y + 20]])
 let box = await evaluate('[view.box, view.copy && view.copy.length]')
 check('box drag selects a rectangle', JSON.stringify(box[0]) == JSON.stringify([X, Y + 20, X + 20, Y + 45]) && box[1] == 21 * 26 * 4, JSON.stringify(box))
 
+// 9b. the flip-switch tool flips only the toggle that was clicked
+{
+    // two small toggles two cells apart vertically, and a big toggle
+    await evaluate(`draw_on_chip(f => {
+        for (const [x, y, k] of [[${X} + 30, ${Y} + 5, 'small_toggle'], [${X} + 30, ${Y} + 7, 'small_toggle'], [${X} + 40, ${Y} + 8, 'toggle']]) {
+            let i = x*4 + y*W*4; f[i] = things[k].code; f[i+1] = 0; f[i+2] = 0; f[i+3] = things[k].big ? 255 : 0 }
+    }, { history : false })`)
+    await evaluate(`T.select('toggle_toggle')`)
+    const state = (x, y) => evaluate(`T.snap()[(${x})*4 + (${y})*W*4 + 1] > 0`)
+    await mouseClick(X + 30, Y + 5)
+    check('clicking the lower small toggle flips only it', await state(X + 30, Y + 5) && !await state(X + 30, Y + 7))
+    await mouseClick(X + 30, Y + 7)
+    check('clicking the upper small toggle flips only it', await state(X + 30, Y + 7) && await state(X + 30, Y + 5))
+    // a big toggle's anchor is its top-left cell; click its bottom-right cell
+    await mouseClick(X + 42, Y + 6)
+    check('clicking anywhere on a big toggle flips it', await state(X + 40, Y + 8))
+}
+
 // 10. mouse wheel / trackpad scroll zooms around the cursor
 {
     const pt = { x: 400, y: 350 }
