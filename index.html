@@ -8,7 +8,7 @@
 </body>
 <script>
 
-console.log('0.0.7')
+console.log('0.0.8')
 
 var tau = Math.PI * 2
 
@@ -315,13 +315,20 @@ function loop() {
         else gl.uniform4f(u_red_box, 0, 0, -1, -1)
 
         gl.drawArrays(gl.TRIANGLES, 0, 3)
-    }
+        if (window.draw_overlay) draw_overlay()
+    } else if (window.overlay_dirty && window.draw_overlay) draw_overlay()
 
     window.requestAnimationFrame(loop)
 }
 
 function each(x, cb) {
     Object.entries(x).forEach(([k, v]) => cb(v, k))
+}
+
+// zoom limits: from the whole board fitting in ~256 device px, up to 100
+// screen pixels per cell
+function clamp_scale(scale) {
+    return Math.min(100 * devicePixelRatio, Math.max(0.25, scale))
 }
 
 function set_scale(new_zoom) {
@@ -1203,7 +1210,7 @@ c.addEventListener('pointermove', function (e) {
     if (pinch && pointers.size == 2) {
         var m = pointer_mid()
         if (pinch.dist > 0 && m.dist > 0) {
-            var scale = Math.min(64, Math.max(0.25, pinch.scale * m.dist / pinch.dist))
+            var scale = clamp_scale(pinch.scale * m.dist / pinch.dist)
             if (scale != view.scale) set_scale(scale)
         }
         put_board_point(pinch.anchor, m.x, m.y)
@@ -1811,4 +1818,259 @@ function rot(a, r) {
         a[0] * Math.sin(r) + a[1] * Math.cos(r)]
 }
 
+</script>
+<script>
+// etched gates: as you zoom in, schematic gate symbols (AND / OR / NAND / NOT)
+// are etched into the gates' own coloured blocks, along with their input and
+// output wires. They fade in while a gate's 3x3 block grows from 25 to 40
+// screen pixels across. The lines scale with the zoom.
+
+var overlay_min_gate_px = 25
+var overlay_fade_ratio = 1.6   // fully drawn at 1.6x the start: 25 -> 40
+var label_fade_from_px = 60    // gate names (AND, OR, ...) fade in from 60 to 90 px
+var label_fade_to_px = 90
+var overlay_dirty = true
+var overlay = document.createElement('canvas')
+overlay.style.position = 'fixed'
+overlay.style['pointer-events'] = 'none'
+document.body.append(overlay)
+var og = overlay.getContext('2d')
+bottom_d.addEventListener('scroll', () => overlay_dirty = true)
+window.addEventListener('resize', () => overlay_dirty = true)
+new ResizeObserver(() => overlay_dirty = true).observe(c)
+
+// mouse wheel / two-finger trackpad scroll zooms smoothly around the
+// pointer (drag pans). A trackpad pinch arrives as ctrl+wheel in Chrome and
+// Firefox, and as gesture events in Safari.
+function zoom_around(client_x, client_y, factor) {
+    var p = board_point(client_x, client_y)
+    set_scale(clamp_scale(view.scale * factor))
+    put_board_point(p, client_x, client_y)
+    overlay_dirty = true
+}
+bottom_d.addEventListener('wheel', function (e) {
+    e.preventDefault()
+    var dy = e.deltaY * (e.deltaMode == 1 ? 16 : e.deltaMode == 2 ? 400 : 1)
+    zoom_around(e.clientX, e.clientY, Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.002)))
+}, { passive : false })
+var gesture_scale = 1
+bottom_d.addEventListener('gesturestart', e => { e.preventDefault(); gesture_scale = 1 })
+bottom_d.addEventListener('gesturechange', function (e) {
+    e.preventDefault()
+    zoom_around(e.clientX, e.clientY, e.scale / gesture_scale)
+    gesture_scale = e.scale
+})
+
+var gate_kinds = { and_gate : 'AND', or_gate : 'OR', nand_gate : 'NAND' }
+
+// pins in gate-local cell coordinates: origin at the centre of the 3x3
+// block, +x right, +y down (screen orientation)
+var input_pins = [[-1, -2], [1, -2], [2, -1], [2, 1], [-1, 2], [1, 2], [-2, -1], [-2, 1]]
+var output_pins = { right : [2, 0], bottom : [0, 2], left : [-2, 0], top : [0, -2] }
+var output_angle = { right : 0, bottom : Math.PI / 2, left : Math.PI, top : -Math.PI / 2 }
+
+function rgb(a) { return 'rgb(' + a.join(',') + ')' }
+
+function draw_overlay() {
+    overlay_dirty = false
+    var b = bottom_d.getBoundingClientRect()
+    var cw = bottom_d.clientWidth, ch = bottom_d.clientHeight
+    var dpr = devicePixelRatio
+    overlay.style.left = b.left + 'px'
+    overlay.style.top = b.top + 'px'
+    overlay.style.width = cw + 'px'
+    overlay.style.height = ch + 'px'
+    if (overlay.width != Math.round(cw * dpr)) overlay.width = Math.round(cw * dpr)
+    if (overlay.height != Math.round(ch * dpr)) overlay.height = Math.round(ch * dpr)
+    og.setTransform(1, 0, 0, 1, 0, 0)
+    og.clearRect(0, 0, overlay.width, overlay.height)
+
+    var cs = view.scale / dpr
+    var gate_px = cs * 3
+    if (gate_px < overlay_min_gate_px) return
+    var fade_end = overlay_min_gate_px * overlay_fade_ratio
+    var alpha = Math.min(1, (gate_px - overlay_min_gate_px) / (fade_end - overlay_min_gate_px))
+
+    // read just the visible part of the board (plus a margin for pins)
+    var r = c.getBoundingClientRect()
+    var x0 = Math.max(0, Math.floor((b.left - r.left) / cs) - 4)
+    var x1 = Math.min(W - 1, Math.ceil((b.left + cw - r.left) / cs) + 4)
+    var row0 = Math.floor((b.top - r.top) / cs) - 4
+    var row1 = Math.ceil((b.top + ch - r.top) / cs) + 4
+    var y0 = Math.max(0, H - 1 - row1), y1 = Math.min(H - 1, H - 1 - row0)
+    if (x1 < x0 || y1 < y0) return
+    var w = x1 - x0 + 1, h = y1 - y0 + 1
+    var px = new Uint8Array(w * h * 4)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb2)
+    gl.readPixels(x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px)
+
+    function at(x, y) {
+        if (x < x0 || x > x1 || y < y0 || y > y1) return null
+        var i = ((x - x0) + (y - y0) * w) * 4
+        return { code : px[i], on : px[i + 1] > 0 }
+    }
+
+    for (var y = y0; y <= y1; y++) for (var x = x0; x <= x1; x++) {
+        var t = at(x, y)
+        var kind = gate_kinds[code_to_thing[t.code]]
+        if (!kind) continue
+
+        // the anchor (x, y) is the gate's top-left cell; local (lx, ly)
+        // maps to board cell (x + 1 + lx, y - 1 - ly)
+        var cell = (lx, ly) => at(x + 1 + lx, y - 1 - ly)
+        var is_wire = (lx, ly) => { var q = cell(lx, ly); return q && q.code == things.wire.code ? q : null }
+
+        var outs = Object.keys(output_pins).filter(k => is_wire(...output_pins[k]))
+        var ins = input_pins.filter(p => is_wire(...p))
+        // a NAND with a single input is a NOT
+        if (kind == 'NAND' && ins.length == 1) kind = 'NOT'
+
+        // face the output wire; with no output wire, face away from the inputs
+        var side = outs[0]
+        if (!side) {
+            var mx = ins.reduce((s, p) => s + p[0], 0), my = ins.reduce((s, p) => s + p[1], 0)
+            side = Math.abs(mx) >= Math.abs(my) ? (mx > 0 ? 'left' : 'right') : (my > 0 ? 'top' : 'bottom')
+        }
+        var ang = output_angle[side]
+        var cos = Math.cos(-ang), sin = Math.sin(-ang)
+        var rot = p => [p[0] * cos - p[1] * sin, p[0] * sin + p[1] * cos]
+
+        var sx = r.left - b.left + (x + 1.5) * cs
+        var sy = r.top - b.top + (H - 1 - (y - 1) + 0.5) * cs
+        og.setTransform(cs * dpr, 0, 0, cs * dpr, sx * dpr, sy * dpr)
+        og.rotate(ang)
+        // flat ends, so lines stop exactly at the block edge
+        og.lineCap = 'butt'
+        og.lineJoin = 'round'
+
+        // the symbol is drawn at 75% so the wires have room around it
+        var S = 0.75
+        var back_x = kind == 'OR' ? (yy => S * (-1 + 0.22 * (1 - (yy / S / 0.9) ** 2))) : (yy => -S)
+        // the inverting bubble sits just touching the tip of the body
+        var bubble_r = 0.17
+        var body_tip = kind == 'NAND' ? 0.82 : kind == 'NOT' ? 0.7 : 1.0
+        var inverted = kind == 'NAND' || kind == 'NOT'
+        var tip_x = S * (inverted ? body_tip + 2 * bubble_r : body_tip)
+
+        // every line is drawn once, opaque: black when the gate is on,
+        // white when it's off. While fading in, the colour is mixed from the
+        // gate's own colour (still opaque, so overlapping lines don't stack)
+        // a fixed fraction of a cell at every zoom, like a physical etching
+        var groove = 0.06
+        var base = t.on ? things[code_to_thing[t.code]].on : things[code_to_thing[t.code]].off
+        var target = t.on ? [0, 0, 0] : [255, 255, 255]
+        var line_color = rgb(base.map((v, i) => Math.round(v + (target[i] - v) * alpha)))
+        function etch(path_fn, width) {
+            path_fn()
+            og.lineWidth = width || groove
+            og.strokeStyle = line_color
+            og.stroke()
+        }
+
+        // wires are etched thin when off and bold when on
+        var wire_width = on => on ? groove * 2 : groove * 0.8
+        var to_edge = v => Math.max(-1.5, Math.min(1.5, v))
+        var to_ring = v => Math.max(-1.3, Math.min(1.3, v))
+
+        // input wires. Each input goes around the side of the symbol it's
+        // on (above or below the gate's axis) to the back. Within a side,
+        // the wire with the longest trip gets the innermost track and the
+        // outermost spot on the back; shorter trips nest outside it. Nested
+        // like that, no two wires cross or share a track.
+        var local_ins = ins.map(p => ({ q : rot(p).map(Math.round), on : is_wire(...p).on }))
+        ;[-1, 1].forEach(side => {
+            // work in a frame where this side is up (y < 0)
+            var group = local_ins.filter(w => Math.sign(w.q[1]) == side)
+                .map(w => ({ x : w.q[0], y : w.q[1] * -side, on : w.on }))
+            // how far round from the back each pin is: 0 at the back, pi at the front
+            group.forEach(w => w.d = Math.atan2(-w.y, -w.x))
+            group.sort((a, b) => b.d - a.d)
+            var n = group.length
+            group.forEach((w, r) => {
+                // tracks are spread evenly between 1.0 and 1.4 from the centre
+                var lane = 1.0 + (r + 0.5) * 0.4 / n
+                // spread over this side's half of the back, or the whole back
+                // when every input comes from this side
+                var span = n == local_ins.length ? 1.3 : 0.5
+                var ay = local_ins.length == 1 ? 0 : S * (-0.65 + (r + 0.5) * span / n)
+                // entry point on the block edge next to the pin
+                var e = Math.abs(w.x) == 2 ? [Math.sign(w.x) * 1.5, w.y] : [w.x, -1.5]
+                var pts = [e]
+                if (e[0] == -1.5) {
+                    pts.push([-lane, e[1]])
+                } else if (e[0] == 1.5) {
+                    pts.push([lane, e[1]], [lane, -lane], [-lane, -lane])
+                } else {
+                    pts.push([e[0], -lane], [-lane, -lane])
+                }
+                pts.push([-lane, ay], [back_x(ay), ay])
+                etch(() => {
+                    og.beginPath()
+                    pts.forEach(([x, y], i) => i ? og.lineTo(x, y * -side) : og.moveTo(x, y * -side))
+                }, wire_width(w.on))
+            })
+        })
+
+        // output wires: the main one straight out, any others branch off it;
+        // all carry the gate's output
+        etch(() => {
+            og.beginPath()
+            og.moveTo(tip_x, 0)
+            og.lineTo(1.5, 0)
+            outs.slice(1).forEach(k => {
+                var q = rot(output_pins[k])
+                var qy = q[1] < 0 ? -1.3 : q[1] > 0 ? 1.3 : 0
+                og.moveTo(1.3, 0)
+                og.lineTo(1.3, qy)
+                og.lineTo(to_ring(q[0]), qy)
+                og.lineTo(to_edge(q[0]), to_edge(q[1]))
+            })
+        }, wire_width(t.on))
+
+        // gate body
+        var body = () => {
+            og.save()
+            og.scale(S, S)
+            og.beginPath()
+            if (kind == 'OR') {
+                og.moveTo(-1, -0.9)
+                og.quadraticCurveTo(0.35, -0.9, 1, 0)
+                og.quadraticCurveTo(0.35, 0.9, -1, 0.9)
+                og.quadraticCurveTo(-0.6, 0, -1, -0.9)
+            } else if (kind == 'NOT') {
+                og.moveTo(-1, -0.8)
+                og.lineTo(body_tip, 0)
+                og.lineTo(-1, 0.8)
+                og.closePath()
+            } else {
+                var shift = kind == 'NAND' ? -0.18 : 0
+                og.moveTo(-1, -0.9)
+                og.lineTo(0.1 + shift, -0.9)
+                og.arc(0.1 + shift, 0, 0.9, -Math.PI / 2, Math.PI / 2)
+                og.lineTo(-1, 0.9)
+                og.closePath()
+            }
+            if (inverted) {
+                og.moveTo(body_tip + 2 * bubble_r, 0)
+                og.arc(body_tip + bubble_r, 0, bubble_r, 0, Math.PI * 2)
+            }
+            og.restore()
+        }
+        etch(body)
+
+        // label, kept upright, same colour as the lines
+        var label_alpha = Math.min(alpha, (gate_px - label_fade_from_px) / (label_fade_to_px - label_fade_from_px))
+        if (label_alpha > 0) {
+            og.save()
+            og.translate(S * (kind == 'OR' ? -0.15 : kind == 'NOT' ? -0.45 : -0.3), 0)
+            og.rotate(-ang)
+            og.font = 'bold ' + (kind == 'NOT' ? 0.26 : 0.34) + 'px sans-serif'
+            og.textAlign = 'center'
+            og.textBaseline = 'middle'
+            og.fillStyle = rgb(base.map((v, i) => Math.round(v + (target[i] - v) * label_alpha)))
+            og.fillText(kind, 0, 0)
+            og.restore()
+        }
+    }
+}
 </script>
