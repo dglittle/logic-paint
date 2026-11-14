@@ -8,7 +8,7 @@
 </body>
 <script>
 
-console.log('0.0.8')
+console.log('0.0.9')
 
 var tau = Math.PI * 2
 
@@ -1604,14 +1604,14 @@ function my_on_mouse_up(pos, e) {
 
     if (view.brush == 'toggle_toggle') {
         draw_on_chip(f => {
-            for (var dy = 0; dy <= 2; dy++) {
-                for (var dx = -2; dx <= 0; dx++) {
-                    let thing = code_to_thing[f[(x + dx) * 4 + (y + dy) * W * 4]]
-                    if (thing == 'toggle' || thing == 'small_toggle') {
-                        f[(x + dx) * 4 + (y + dy) * W * 4 + 1] = f[(x + dx) * 4 + (y + dy) * W * 4 + 1] > 0 ? 0 : 255
-                    }
-                }
-            }
+            // flip just one toggle: the small toggle that was clicked, or
+            // else the big (3x3) toggle covering the clicked cell
+            var hit = null
+            if (code_to_thing[f[x * 4 + y * W * 4]] == 'small_toggle') hit = x * 4 + y * W * 4
+            for (var dy = 0; dy <= 2 && hit == null; dy++)
+                for (var dx = -2; dx <= 0 && hit == null; dx++)
+                    if (code_to_thing[f[(x + dx) * 4 + (y + dy) * W * 4]] == 'toggle') hit = (x + dx) * 4 + (y + dy) * W * 4
+            if (hit != null) f[hit + 1] = f[hit + 1] > 0 ? 0 : 255
         }, { history : false })
     } else if (view.brush == 'flip') {
         draw_on_chip(f => {
