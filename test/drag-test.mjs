@@ -226,6 +226,39 @@ await mouseDrag([[X, Y + 45], [X + 20, Y + 20]])
 let box = await evaluate('[view.box, view.copy && view.copy.length]')
 check('box drag selects a rectangle', JSON.stringify(box[0]) == JSON.stringify([X, Y + 20, X + 20, Y + 45]) && box[1] == 21 * 26 * 4, JSON.stringify(box))
 
+// 10. mouse wheel / trackpad scroll zooms around the cursor
+{
+    const pt = { x: 400, y: 350 }
+    const before = await evaluate(`[board_point(${pt.x}, ${pt.y}), view.scale]`)
+    for (let i = 0; i < 5; i++) { await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: pt.x, y: pt.y, deltaX: 0, deltaY: -60 }); await sleep(50) }
+    const after = await evaluate(`[board_point(${pt.x}, ${pt.y}), view.scale]`)
+    // scroll positions are whole pixels, so allow up to 3 screen pixels of drift
+    const errPx = Math.hypot(after[0].x - before[0].x, after[0].y - before[0].y) * after[1] / await evaluate('devicePixelRatio')
+    check('wheel zooms in around the cursor', after[1] > before[1] * 1.5 && errPx < 3, before[1].toFixed(1) + ' -> ' + after[1].toFixed(1) + ', drift ' + errPx.toFixed(1) + ' px')
+    for (let i = 0; i < 5; i++) { await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: pt.x, y: pt.y, deltaX: 0, deltaY: 60 }); await sleep(50) }
+    check('wheel back out restores the zoom', Math.abs(await evaluate('view.scale') - before[1]) < 0.01)
+}
+
+// 11. etched gates: drawn when gates are big on screen, not when small
+{
+    // count the overlay's stroke calls (reading canvas pixels back is flaky
+    // in headless Chrome)
+    const inked = () => evaluate(`(() => { let n = 0, orig = og.stroke
+        og.stroke = function () { n++; return orig.apply(this, arguments) }
+        try { draw_overlay() } finally { og.stroke = orig }
+        return n })()`)
+    // centre on a gate
+    const g = await evaluate(`(() => { let s = T.snap()
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (code_to_thing[s[x*4 + y*W*4]] == 'nand_gate') return { x, y } })()`)
+    const show = async gatePx => {
+        await evaluate(`set_scale(${gatePx / 3} * devicePixelRatio); put_board_point({ x : ${g.x} + 1.5, y : H - 1 - ${g.y} + 1.5 }, innerWidth / 2, innerHeight / 2)`)
+        return inked()
+    }
+    const small = await show(20), big = await show(120)
+    check('etched gates hidden when gates are small (20 px)', small == 0, small + ' lines drawn')
+    check('etched gates drawn when gates are big (120 px)', big > 10, big + ' lines drawn')
+}
+
 // ---------------- phone, touch ----------------
 await load(true)
 await evaluate(`view.scale = 0; set_zoom(24)`)   // 8 css px per cell at dpr 3
